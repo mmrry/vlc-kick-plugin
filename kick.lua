@@ -60,11 +60,12 @@ local VOD_SOURCES = { "dvr", "vod" }
 local VOD_PREFER_RAW = true
 -- Long VODs: MPEG-TS timestamps wrap around every 26.5 h of video (2^33 at
 -- 90 kHz) and Kick recordings don't start at 0, so the wrap can fall anywhere.
--- VLC 3 can't play or seek past it (stuck at "Buffering 0%"). The plugin then
--- splits the VOD into parts at the wrap points (local playlists in the temp
--- folder) and starts in the part that holds ?t=.
--- "auto" = only on VLC 3, true = always, false = never
-local SPLIT_AT_TS_WRAP = "auto"
+-- VLC 3 can't play or seek past it (stuck at "Buffering 0%"), VLC 4.0-dev
+-- aborts with "Assertion failed: ts >= VLC_TICK_INVALID" (FakeESOut.cpp).
+-- The plugin then splits the VOD into parts at the wrap points (local
+-- playlists in the temp folder) and starts in the part that holds ?t=.
+-- true = always, "auto" = only on VLC 3, false = never
+local SPLIT_AT_TS_WRAP = true
 
 ----------------------------------------------------------------------------
 
