@@ -66,6 +66,10 @@ local VOD_PREFER_RAW = true
 -- playlists in the temp folder) and starts in the part that holds ?t=.
 -- true = always, "auto" = only on VLC 3, false = never
 local SPLIT_AT_TS_WRAP = true
+-- Longest part, in seconds. VLC takes a timestamp jump of more than half the
+-- wrap period (2^32 ticks = 13.25 h) for a wrap, so seeking further than
+-- that from the start of a part fails the same way. Keep it below 13 h.
+local MAX_PART_S = 12 * 3600
 
 ----------------------------------------------------------------------------
 
@@ -667,29 +671,31 @@ local function vod_items(url, video_id, start, base, still_live)
     local segs  = m.segs
     local data  = http_get(segs[1].uri, 65536)
     local pts   = data and first_pts(data)
-    if not pts then
-        vlc.msg.dbg(TAG .. "no timestamp in the first segment, wrap not checked")
-        return plain
-    end
     local WRAP = 2 ^ 33 / 90000                 -- 95443.7 s
-    local first_wrap = WRAP - pts / 90000      -- seconds into the VOD
-    if first_wrap >= m.total then
+    local first_wrap = math.huge               -- seconds into the VOD
+    if pts then
+        first_wrap = WRAP - pts / 90000
+    else
+        vlc.msg.dbg(TAG .. "no timestamp in the first segment, wrap position unknown")
+    end
+    if first_wrap >= m.total and m.total <= MAX_PART_S then
         vlc.msg.dbg(TAG .. "no timestamp wrap in this VOD")
         return plain
     end
 
-    -- Cut before the first segment that starts past each wrap point
-    -- (the segment holding the wrap stays in the earlier part)
+    -- Cut before the first segment that starts past each wrap point (the
+    -- segment holding the wrap stays in the earlier part), and keep every
+    -- part shorter than MAX_PART_S
     local parts, cur, b = {}, { first = 1 }, first_wrap
     for i, s in ipairs(segs) do
-        if s.start >= b then
-            if i > cur.first then
-                cur.last = i - 1
-                parts[#parts + 1] = cur
-                cur = { first = i }
-            end
-            while b <= s.start do b = b + WRAP end
+        local at_wrap = s.start >= b
+        local too_long = s.start - segs[cur.first].start >= MAX_PART_S
+        if (at_wrap or too_long) and i > cur.first then
+            cur.last = i - 1
+            parts[#parts + 1] = cur
+            cur = { first = i }
         end
+        while b <= s.start do b = b + WRAP end
     end
     cur.last = #segs
     parts[#parts + 1] = cur
@@ -705,8 +711,10 @@ local function vod_items(url, video_id, start, base, still_live)
         if start and start >= p.start then first_part = j end
     end
 
-    vlc.msg.info(string.format("%sVOD crosses an MPEG-TS timestamp wrap at %s, split into %d parts",
-        TAG, hms(first_wrap), #parts))
+    vlc.msg.info(string.format("%sVOD is %s long, timestamp wrap %s, split into %d parts (max %s each)",
+        TAG, hms(m.total),
+        first_wrap < m.total and ("at " .. hms(first_wrap)) or "none",
+        #parts, hms(MAX_PART_S)))
 
     local items, sep = {}, IS_WIN and "\\" or "/"
     for j = first_part, #parts do
