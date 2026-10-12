@@ -55,8 +55,8 @@ local LIVE_EDGE_DELAY_MS = 0
 -- VOD source order. "dvr" is the raw recording on stream.kick.com (no ads),
 -- "vod" is Kick's ad-stitched manifest on web.kick.com.
 local VOD_SOURCES = { "dvr", "vod" }
--- Use the raw recording on stream.kick.com (no ads) when Kick only hands out
--- the ad-stitched manifest
+-- Play VODs from the raw recording on stream.kick.com: no ads, working seek
+-- bar, and byte-range chunks (~2 s) that make seeking and ?t= fast
 local VOD_PREFER_RAW = true
 -- Long VODs: MPEG-TS timestamps wrap around every 26.5 h of video (2^33 at
 -- 90 kHz) and Kick recordings don't start at 0, so the wrap can fall anywhere.
@@ -311,10 +311,12 @@ local function pick_variant(master, base)
     return best or fallback
 end
 
--- Media playlist -> header tag lines + segments { lines, start, dur }
+-- Media playlist -> header tag lines + segments { lines, start, dur, uri }
 local function parse_media(text, base)
-    local header, segs, pending, t, dur = {}, {}, nil, 0, nil
+    local header, segs, pending, t, dur = {}, {}, {}, 0, nil
     local cur_map, cur_key   -- EXT-X-MAP / EXT-X-KEY in effect (re-emitted per part)
+    local range              -- pending EXT-X-BYTERANGE { length, offset or nil }
+    local next_off = {}      -- implicit byte-range offsets, per file
     local function abs_uri_attr(line)
         return (line:gsub('URI="([^"]+)"', function(u) return 'URI="' .. resolve_url(base, u) .. '"' end))
     end
@@ -327,22 +329,32 @@ local function parse_media(text, base)
             or line:match("^#EXT%-X%-PLAYLIST%-TYPE") or line:match("^#EXT%-X%-INDEPENDENT%-SEGMENTS")
             or line:match("^#EXT%-X%-ALLOW%-CACHE") then
             header[#header + 1] = line
+        elseif line:match("^#EXT%-X%-BYTERANGE") then
+            local len, off = line:match("^#EXT%-X%-BYTERANGE:%s*(%d+)@?(%d*)")
+            range = len and { tonumber(len), tonumber(off) } or nil
         elseif line:match("^#") then
-            -- per-segment tag (EXTINF, BYTERANGE, PROGRAM-DATE-TIME, DISCONTINUITY, MAP, KEY...)
+            -- per-segment tag (EXTINF, PROGRAM-DATE-TIME, DISCONTINUITY, MAP, KEY...)
             line = abs_uri_attr(line)
             if line:match("^#EXT%-X%-MAP") then cur_map = line end
             if line:match("^#EXT%-X%-KEY") then cur_key = line end
             if line:match("^#EXTINF:") then
                 dur = tonumber(line:match("^#EXTINF:%s*([%d%.]+)")) or 0
             end
-            pending = pending or {}
             pending[#pending + 1] = line
         elseif line:match("%S") and dur then
-            pending[#pending + 1] = resolve_url(base, line)
+            local uri = resolve_url(base, line)
+            if range then
+                -- a range without @offset continues the previous range of the
+                -- same file: make every offset explicit so parts stand alone
+                local off = range[2] or next_off[uri] or 0
+                pending[#pending + 1] = "#EXT-X-BYTERANGE:" .. range[1] .. "@" .. off
+                next_off[uri] = off + range[1]
+            end
+            pending[#pending + 1] = uri
             segs[#segs + 1] = { lines = pending, start = t, dur = dur,
-                                uri = pending[#pending], map = cur_map, key = cur_key }
+                                uri = uri, map = cur_map, key = cur_key }
             t = t + dur
-            pending, dur = nil, nil
+            pending, dur, range = {}, nil, nil
         end
     end
     return header, segs, t
@@ -594,45 +606,61 @@ end
 
 -- Resolve the VOD to playlist items: raw recording when possible, and split
 -- into parts at MPEG-TS timestamp wrap points for VLC 3
+local RAW_DIR = "(https?://stream%.kick%.com/[^\r\n\"]-/media/hls/)"
+
+-- The stream.kick.com ".../media/hls/" folder of the recording behind a
+-- playlist (Kick's ad-stitched manifest references its segments)
+local function raw_prefix(url)
+    local p = url:match("^" .. RAW_DIR)
+    if p then return p end
+    local text = http_get(url)
+    if not text then return nil end
+    p = text:match(RAW_DIR)
+    if p then return p end
+    local variant = text:match("#EXT%-X%-STREAM%-INF:[^\r\n]*[\r\n]+([^\r\n#][^\r\n]*)")
+    if not variant then return nil end
+    text = http_get(resolve_url(url, variant), 65536)   -- the first segments are enough
+    return text and text:match(RAW_DIR)
+end
+
+-- Raw recording playlists, best first. The byte-range one cuts every ~10 s
+-- segment (~12 MB at 1080p60) into ~2 s chunks: VLC downloads one chunk per
+-- seek instead of a whole segment, so seeking and ?t= start much faster.
+local RAW_PLAYLISTS = { "byte-range-multivariant.m3u8", "master.m3u8" }
+
 local function vod_items(url, video_id, start, base, still_live)
+    if VOD_PREFER_RAW and not url:find("byte%-range%-multivariant") then
+        local prefix = raw_prefix(url)
+        for _, name in ipairs(prefix and RAW_PLAYLISTS or {}) do
+            local cand = prefix .. name
+            if cand == url then break end
+            local text = http_get(cand)
+            if text and text:find("#EXT-X-STREAM-INF", 1, true) then
+                vlc.msg.dbg(TAG .. "using the raw recording " .. cand)
+                url = cand
+                break
+            end
+        end
+        if not prefix then
+            vlc.msg.dbg(TAG .. "raw recording not found, using " .. url)
+        end
+    end
     local plain = { vod_item(base, url, start) }
+
+    local split = SPLIT_AT_TS_WRAP
+    if split == "auto" then split = vlc_major() < 4 end
+    if not split or still_live then return plain end
 
     local m = load_media(url)
     if not m then
         vlc.msg.dbg(TAG .. "VOD playlist not readable here, handing it to VLC as is")
         return plain
     end
-
-    local function has_ads(segs)
-        for _, s in ipairs(segs) do
-            if not s.uri:find("^https?://stream%.kick%.com/") then return true end
+    for _, s in ipairs(m.segs) do
+        if not s.uri:find("^https?://stream%.kick%.com/") then
+            vlc.msg.dbg(TAG .. "ads in the VOD playlist, timestamp wrap not checked")
+            return plain
         end
-        return false
-    end
-    local ads = has_ads(m.segs)
-
-    -- Ad-stitched manifest: switch to the raw recording it is built from
-    if ads and VOD_PREFER_RAW then
-        local prefix
-        for _, s in ipairs(m.segs) do
-            prefix = s.uri:match("^(https?://stream%.kick%.com/.-/media/hls/)")
-            if prefix then break end
-        end
-        local raw = prefix and (prefix .. "master.m3u8")
-        local m2 = raw and load_media(raw)
-        if m2 and not has_ads(m2.segs) then
-            vlc.msg.dbg(TAG .. "using the raw recording " .. raw)
-            url, m, ads = raw, m2, false
-            plain = { vod_item(base, url, start) }
-        end
-    end
-
-    local split = SPLIT_AT_TS_WRAP
-    if split == "auto" then split = vlc_major() < 4 end
-    if not split or still_live then return plain end
-    if ads then
-        vlc.msg.dbg(TAG .. "ads in the VOD playlist, timestamp wrap not checked")
-        return plain
     end
 
     local segs  = m.segs
