@@ -14,7 +14,7 @@ Works with **VLC 3.0.x** and **VLC 4.0-dev**.
 - **VODs**: past broadcasts, including ones still being recorded.
 - **VOD timestamps**: `?t=54582` or `?t=15h9m42s` starts playback at that point.
 - **Clips**: both the clip page link and the `?clip=` dialog link.
-- **Ad-free VODs**: VODs play from the plain recording when Kick provides one, rather than the version with ads inserted.
+- **Ad-free VODs with fast seeking**: VODs play from the raw recording in ≈2-second byte-range chunks, so a seek downloads ~2 MB instead of a whole 12 MB segment.
 - **Metadata**: title, streamer name, category and clip author are filled in.
 - **Fallbacks**: if Kick's current web API fails, the plugin tries Kick's older API.
 - **Configurable**: maximum resolution, live latency and VOD source order are set at the top of the file.
@@ -88,8 +88,8 @@ To change a setting, edit it at the top of `kick.lua` and restart VLC:
 | `OPTIONS` | `{ ":adaptive-logic=highest" }` | Extra VLC input options for every item. `highest` starts at the best quality instead of ramping up. `":adaptive-logic=nearoptimal"` adapts to bandwidth instead. |
 | `LIVE_EDGE_DELAY_MS` | `0` | Distance from the live edge in ms. `0` = VLC default. Larger values, e.g. `15000`, add latency but stall less. |
 | `VOD_SOURCES` | `{ "dvr", "vod" }` | Order in which VOD sources are tried. `dvr` = plain recording (no ads), `vod` = Kick's version with ads inserted. |
-| `VOD_PREFER_RAW` | `true` | When Kick returns only the version with ads, play the raw recording on `stream.kick.com` it was built from. |
-| `SPLIT_AT_TS_WRAP` | `"auto"` | Split long VODs at MPEG-TS timestamp wraparounds (see [Long VODs on VLC 3](#long-vods-on-vlc-3)). `"auto"` = VLC 3 only, `true` = always, `false` = never. |
+| `VOD_PREFER_RAW` | `true` | Play VODs from the raw recording on `stream.kick.com` instead of Kick's ad-stitched manifest. Uses the byte-range playlist (≈2 s chunks) when available, for fast seeking. |
+| `SPLIT_AT_TS_WRAP` | `true` | Split long VODs at MPEG-TS timestamp wraparounds (see [Long VODs](#long-vods)). `true` = always, `"auto"` = VLC 3 only, `false` = never. |
 
 ## How it works
 
@@ -119,24 +119,26 @@ To see what the plugin is doing, open **Tools → Messages**, set the verbosity 
 | `blocked by Cloudflare` | Kick's Cloudflare protection rejected curl. Try again later, from another network, or with a newer curl. If it keeps happening, please open an issue. |
 | `empty response (is curl installed?)` | curl is missing or not on `PATH`. Set `CURL` to the full path of the curl executable. |
 | `failed to parse channel name from url` | The link isn't in one of the supported formats. |
-| VOD stuck at "Buffering 0%" | The VOD crosses a timestamp wrap. See [Long VODs on VLC 3](#long-vods-on-vlc-3). Look for `VOD crosses an MPEG-TS timestamp wrap` in the log. |
+| Slow seeking in a VOD | Make sure `VOD_PREFER_RAW = true`. The log should show `using the raw recording …/byte-range-multivariant.m3u8`. Lowering `MAX_HEIGHT` (e.g. `720`) also makes chunks smaller. |
+| VOD stuck at "Buffering 0%" (VLC 3), or VLC 4 crashes with `Assertion failed! ... FakeESOut.cpp ... ts >= VLC_TICK_INVALID` | The VOD crosses a timestamp wrap. Make sure `SPLIT_AT_TS_WRAP = true` and see [Long VODs](#long-vods). Look for `VOD crosses an MPEG-TS timestamp wrap` in the log. |
+| Many `http error: local stream N error: Cancellation (0x8)` lines | Harmless. VLC drops requests for byte-range chunks it no longer needs, mostly while jumping to `?t=` or seeking. Ignore them if the video plays. |
 | `no playable source for VOD` | The VOD was deleted, made private, or has expired (Kick keeps VODs for a limited time). |
 | Nothing happens, VLC shows a web page error | The plugin isn't loaded. Check the install folder and restart VLC. |
 
 **Windows:** a console window may flash briefly when a link is opened. That's curl running, and it's harmless.
 
-## Long VODs on VLC 3
+## Long VODs
 
-Video timestamps in Kick's recordings (MPEG-TS) wrap around to zero every **26.5 hours of video** (2³³ ticks at 90 kHz). Recordings don't start at zero, so the wrap can come much earlier, e.g. 12 hours in. VLC 3 can't play or seek across this point: it gets stuck at "Buffering 0%" with a black screen.
+Video timestamps in Kick's recordings (MPEG-TS) wrap around to zero every **26.5 hours of video** (2³³ ticks at 90 kHz). Recordings don't start at zero, so the wrap can come much earlier, e.g. 12 hours in. Neither VLC version can play or seek across this point. VLC 3 gets stuck at "Buffering 0%" with a black screen. VLC 4.0-dev builds stop with `Assertion failed! ... FakeESOut.cpp ... Expression: ts >= VLC_TICK_INVALID` and close.
 
-To work around this, the plugin reads the first timestamp of the VOD and works out where the wraps fall. On VLC 3 it then splits the VOD into parts at those points:
+To work around this, the plugin reads the first timestamp of the VOD and works out where the wraps fall. It then splits the VOD into parts at those points:
 
 - Each part is a playlist item named like `… [part 2/2, from 12:37:30]`. The parts play one after another.
 - Playback starts in the part that contains `?t=`. Earlier parts are left out.
 - Inside a part, VLC's time display counts from the start of that part, not the start of the VOD. The item name shows where the part begins.
 - The part playlists are small text files (about 1 MB each) saved in your temp folder (`%TEMP%` on Windows) as `kick_<video id>_partN.m3u8`. Opening the same VOD again overwrites them.
 
-VODs without a wrap play as a single item, exactly as before. On VLC 4 nothing is split by default. If a long VOD gets stuck there too, set `SPLIT_AT_TS_WRAP = true`.
+VODs without a wrap play as a single item, exactly as before. Set `SPLIT_AT_TS_WRAP = "auto"` to split on VLC 3 only, or `false` to never split.
 
 ## Known limitations
 
@@ -155,6 +157,13 @@ Bug reports and pull requests are welcome. When reporting a problem, include:
 A HAR file of the failing Kick page, from your browser's DevTools → **Network** → **Save all as HAR**, is the fastest way to adapt the plugin to API changes. Before sharing it, remove the cookies and any `Authorization` headers.
 
 ## Changelog
+
+### 1.0.3
+- Fixed: VLC 4.0-dev closed with `Assertion failed: ts >= VLC_TICK_INVALID` (FakeESOut.cpp) on long VODs. Long VODs are now split at MPEG-TS timestamp wraps on VLC 4 too (`SPLIT_AT_TS_WRAP = true` by default).
+
+### 1.0.2
+- VODs always play from the raw recording on `stream.kick.com`, using its byte-range playlist when available. Seeking and `?t=` downloads ~2 MB chunks instead of whole ~12 MB segments. This also avoids the ad-stitched manifest, where the VLC 4 seek bar could fail.
+- Byte-range offsets are written out explicitly in split VOD parts.
 
 ### 1.0.1
 - Fixed: on VLC 3, long VODs got stuck at "Buffering 0%" when opened or seeked past an MPEG-TS timestamp wrap. They're now split into parts at the wrap points.
