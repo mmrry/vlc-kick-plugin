@@ -88,6 +88,8 @@ To change a setting, edit it at the top of `kick.lua` and restart VLC:
 | `OPTIONS` | `{ ":adaptive-logic=highest" }` | Extra VLC input options for every item. `highest` starts at the best quality instead of ramping up. `":adaptive-logic=nearoptimal"` adapts to bandwidth instead. |
 | `LIVE_EDGE_DELAY_MS` | `0` | Distance from the live edge in ms. `0` = VLC default. Larger values, e.g. `15000`, add latency but stall less. |
 | `VOD_SOURCES` | `{ "dvr", "vod" }` | Order in which VOD sources are tried. `dvr` = plain recording (no ads), `vod` = Kick's version with ads inserted. |
+| `VOD_PREFER_RAW` | `true` | When Kick returns only the version with ads, play the raw recording on `stream.kick.com` it was built from. |
+| `SPLIT_AT_TS_WRAP` | `"auto"` | Split long VODs at MPEG-TS timestamp wraparounds (see [Long VODs on VLC 3](#long-vods-on-vlc-3)). `"auto"` = VLC 3 only, `true` = always, `false` = never. |
 
 ## How it works
 
@@ -117,10 +119,24 @@ To see what the plugin is doing, open **Tools → Messages**, set the verbosity 
 | `blocked by Cloudflare` | Kick's Cloudflare protection rejected curl. Try again later, from another network, or with a newer curl. If it keeps happening, please open an issue. |
 | `empty response (is curl installed?)` | curl is missing or not on `PATH`. Set `CURL` to the full path of the curl executable. |
 | `failed to parse channel name from url` | The link isn't in one of the supported formats. |
+| VOD stuck at "Buffering 0%" | The VOD crosses a timestamp wrap. See [Long VODs on VLC 3](#long-vods-on-vlc-3). Look for `VOD crosses an MPEG-TS timestamp wrap` in the log. |
 | `no playable source for VOD` | The VOD was deleted, made private, or has expired (Kick keeps VODs for a limited time). |
 | Nothing happens, VLC shows a web page error | The plugin isn't loaded. Check the install folder and restart VLC. |
 
 **Windows:** a console window may flash briefly when a link is opened. That's curl running, and it's harmless.
+
+## Long VODs on VLC 3
+
+Video timestamps in Kick's recordings (MPEG-TS) wrap around to zero every **26.5 hours of video** (2³³ ticks at 90 kHz). Recordings don't start at zero, so the wrap can come much earlier, e.g. 12 hours in. VLC 3 can't play or seek across this point: it gets stuck at "Buffering 0%" with a black screen.
+
+To work around this, the plugin reads the first timestamp of the VOD and works out where the wraps fall. On VLC 3 it then splits the VOD into parts at those points:
+
+- Each part is a playlist item named like `… [part 2/2, from 12:37:30]`. The parts play one after another.
+- Playback starts in the part that contains `?t=`. Earlier parts are left out.
+- Inside a part, VLC's time display counts from the start of that part, not the start of the VOD. The item name shows where the part begins.
+- The part playlists are small text files (about 1 MB each) saved in your temp folder (`%TEMP%` on Windows) as `kick_<video id>_partN.m3u8`. Opening the same VOD again overwrites them.
+
+VODs without a wrap play as a single item, exactly as before. On VLC 4 nothing is split by default. If a long VOD gets stuck there too, set `SPLIT_AT_TS_WRAP = true`.
 
 ## Known limitations
 
@@ -139,6 +155,11 @@ Bug reports and pull requests are welcome. When reporting a problem, include:
 A HAR file of the failing Kick page, from your browser's DevTools → **Network** → **Save all as HAR**, is the fastest way to adapt the plugin to API changes. Before sharing it, remove the cookies and any `Authorization` headers.
 
 ## Changelog
+
+### 1.0.1
+- Fixed: on VLC 3, long VODs got stuck at "Buffering 0%" when opened or seeked past an MPEG-TS timestamp wrap. They're now split into parts at the wrap points.
+- VODs play from the raw recording (no ads) when Kick returns only the version with ads.
+- VODs play at the best quality up to `MAX_HEIGHT` when split into parts.
 
 ### 1.0.0
 - First release: live streams, VODs with `?t=` timestamps, and clips
