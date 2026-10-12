@@ -407,6 +407,14 @@ local function write_part(path, header, segs, first, last, target)
     end
     if not has_type then f:write("#EXT-X-PLAYLIST-TYPE:VOD\n") end
     f:write("#EXT-X-MEDIA-SEQUENCE:", first - 1, "\n")
+    -- MAP/KEY declared earlier in the full playlist still apply to this part
+    local own = table.concat(segs[first].lines, "\n")
+    if segs[first].key and not own:find("#EXT-X-KEY", 1, true) then
+        f:write(segs[first].key, "\n")
+    end
+    if segs[first].map and not own:find("#EXT-X-MAP", 1, true) then
+        f:write(segs[first].map, "\n")
+    end
     for i = first, last do
         for _, l in ipairs(segs[i].lines) do f:write(l, "\n") end
     end
@@ -560,6 +568,132 @@ end
 -- VOD
 ----------------------------------------------------------------------------
 
+local function vod_item(base, path, start, suffix)
+    local item = {}
+    for k, v in pairs(base) do item[k] = v end
+    item.path = path
+    if suffix then item.name = item.name .. suffix end
+    start = start and math.floor(start)
+    item.options = item_options((start and start > 0) and { ":start-time=" .. start } or nil)
+    return item
+end
+
+local function load_media(url)
+    local text = http_get(url)
+    if not text or not text:find("#EXTM3U", 1, true) then return nil end
+    local variant = url
+    if text:find("#EXT-X-STREAM-INF", 1, true) then
+        variant = pick_variant(text, url)
+        text = variant and http_get(variant)
+        if not text then return nil end
+    end
+    local header, segs, total = parse_media(text, variant)
+    if #segs == 0 then return nil end
+    return { header = header, segs = segs, total = total, variant = variant }
+end
+
+-- Resolve the VOD to playlist items: raw recording when possible, and split
+-- into parts at MPEG-TS timestamp wrap points for VLC 3
+local function vod_items(url, video_id, start, base, still_live)
+    local plain = { vod_item(base, url, start) }
+
+    local m = load_media(url)
+    if not m then
+        vlc.msg.dbg(TAG .. "VOD playlist not readable here, handing it to VLC as is")
+        return plain
+    end
+
+    local function has_ads(segs)
+        for _, s in ipairs(segs) do
+            if not s.uri:find("^https?://stream%.kick%.com/") then return true end
+        end
+        return false
+    end
+    local ads = has_ads(m.segs)
+
+    -- Ad-stitched manifest: switch to the raw recording it is built from
+    if ads and VOD_PREFER_RAW then
+        local prefix
+        for _, s in ipairs(m.segs) do
+            prefix = s.uri:match("^(https?://stream%.kick%.com/.-/media/hls/)")
+            if prefix then break end
+        end
+        local raw = prefix and (prefix .. "master.m3u8")
+        local m2 = raw and load_media(raw)
+        if m2 and not has_ads(m2.segs) then
+            vlc.msg.dbg(TAG .. "using the raw recording " .. raw)
+            url, m, ads = raw, m2, false
+            plain = { vod_item(base, url, start) }
+        end
+    end
+
+    local split = SPLIT_AT_TS_WRAP
+    if split == "auto" then split = vlc_major() < 4 end
+    if not split or still_live then return plain end
+    if ads then
+        vlc.msg.dbg(TAG .. "ads in the VOD playlist, timestamp wrap not checked")
+        return plain
+    end
+
+    local segs  = m.segs
+    local data  = http_get(segs[1].uri, 65536)
+    local pts   = data and first_pts(data)
+    if not pts then
+        vlc.msg.dbg(TAG .. "no timestamp in the first segment, wrap not checked")
+        return plain
+    end
+    local WRAP = 2 ^ 33 / 90000                 -- 95443.7 s
+    local first_wrap = WRAP - pts / 90000      -- seconds into the VOD
+    if first_wrap >= m.total then
+        vlc.msg.dbg(TAG .. "no timestamp wrap in this VOD")
+        return plain
+    end
+
+    -- Cut before the first segment that starts past each wrap point
+    -- (the segment holding the wrap stays in the earlier part)
+    local parts, cur, b = {}, { first = 1 }, first_wrap
+    for i, s in ipairs(segs) do
+        if s.start >= b then
+            if i > cur.first then
+                cur.last = i - 1
+                parts[#parts + 1] = cur
+                cur = { first = i }
+            end
+            while b <= s.start do b = b + WRAP end
+        end
+    end
+    cur.last = #segs
+    parts[#parts + 1] = cur
+
+    local target = 1
+    for _, s in ipairs(segs) do
+        if s.dur > target then target = math.ceil(s.dur) end
+    end
+
+    local first_part = 1
+    for j, p in ipairs(parts) do
+        p.start = segs[p.first].start
+        if start and start >= p.start then first_part = j end
+    end
+
+    vlc.msg.info(string.format("%sVOD crosses an MPEG-TS timestamp wrap at %s, split into %d parts",
+        TAG, hms(first_wrap), #parts))
+
+    local items, sep = {}, IS_WIN and "\\" or "/"
+    for j = first_part, #parts do
+        local p = parts[j]
+        local path = temp_dir() .. sep .. "kick_" .. video_id .. "_part" .. j .. ".m3u8"
+        if not write_part(path, m.header, segs, p.first, p.last, target) then
+            vlc.msg.warn(TAG .. "can't write " .. path .. ", playing the VOD unsplit")
+            return plain
+        end
+        local st = (j == first_part and start) and (start - p.start) or nil
+        items[#items + 1] = vod_item(base, file_uri(path), st,
+            string.format(" [part %d/%d, from %s]", j, #parts, hms(p.start)))
+    end
+    return items
+end
+
 local function parse_vod(video_id, slug)
     vlc.msg.dbg(TAG .. "loading VOD " .. video_id)
 
@@ -600,20 +734,15 @@ local function parse_vod(video_id, slug)
 
     meta = meta or {}
     local who = meta.who or slug or "Kick"
-    local extra = {}
-    local st = start_option(meta.duration)
-    if st then extra[#extra + 1] = st end
-
-    return { {
-        path        = url,
+    local base = {
         name        = TAG .. who .. " - " .. (meta.title or video_id),
         title       = meta.title,
         artist      = who,
         genre       = meta.game,
         description = meta.title,
         url         = vlc.path,
-        options     = item_options(extra),
-    } }
+    }
+    return vod_items(url, video_id, start_seconds(meta.duration), base, meta.status == "live")
 end
 
 ----------------------------------------------------------------------------
